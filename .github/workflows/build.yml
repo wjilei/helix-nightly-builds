@@ -1,0 +1,220 @@
+name: Build Helix master
+
+on:
+  schedule:
+    # Mondays, 02:23 UTC / 10:23 China Standard Time.
+    - cron: '23 2 * * 1'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Rebuild even when upstream has not changed
+        type: boolean
+        default: false
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/build.yml'
+      - 'scripts/**'
+      - 'tests/**'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: helix-master-release
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  prepare:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    outputs:
+      sha: ${{ steps.upstream.outputs.sha }}
+      build: ${{ steps.upstream.outputs.build }}
+      version: ${{ steps.upstream.outputs.version }}
+      tag: ${{ steps.upstream.outputs.tag }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Test packaging
+        run: python3 -m unittest discover -s tests -v
+      - name: Resolve upstream commit and skip unchanged builds
+        id: upstream
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FORCE: ${{ inputs.force || github.event_name == 'push' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          sha=$(gh api repos/helix-editor/helix/commits/master --jq .sha)
+          short=${sha:0:12}
+          timestamp=$(date -u +%Y%m%d%H%M%S)
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "version=0~git${timestamp}.${GITHUB_RUN_NUMBER}.${GITHUB_RUN_ATTEMPT}.${short}" >> "$GITHUB_OUTPUT"
+          echo "tag=nightly-${timestamp}-${short}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_OUTPUT"
+          gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" > releases.json
+          previous=$(jq -sr '[.[][] | select(.draft == false and (.tag_name | startswith("nightly-")))][0].body // ""' releases.json)
+          if [[ "$FORCE" != "true" ]] && grep -Fq "Upstream commit: $sha" <<< "$previous"; then
+            echo 'build=false' >> "$GITHUB_OUTPUT"
+            echo "Upstream unchanged: $sha. No build needed." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo 'build=true' >> "$GITHUB_OUTPUT"
+            echo "Building upstream commit: $sha" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  build:
+    needs: prepare
+    if: needs.prepare.outputs.build == 'true'
+    name: Build ${{ matrix.platform }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows-x64
+            os: windows-2022
+          - platform: linux-x64
+            os: ubuntu-22.04
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    env:
+      UPSTREAM_SHA: ${{ needs.prepare.outputs.sha }}
+      DEB_VERSION: ${{ needs.prepare.outputs.version }}
+    steps:
+      - name: Checkout build scripts
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Checkout exact upstream revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: helix-editor/helix
+          ref: ${{ needs.prepare.outputs.sha }}
+          path: upstream
+          persist-credentials: false
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          workspaces: upstream -> target
+          cache-on-failure: true
+      - name: Build Helix and all configured grammars
+        working-directory: upstream
+        shell: bash
+        run: cargo +stable build --release --locked --package helix-term
+      - name: Package Windows portable ZIP
+        if: runner.os == 'Windows'
+        shell: bash
+        run: python scripts/package.py --source upstream --output dist --sha "$UPSTREAM_SHA"
+      - name: Smoke-test extracted Windows package
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Expand-Archive dist/helix-windows-x64.zip -DestinationPath "$env:RUNNER_TEMP/helix-smoke"
+          Set-Location "$env:RUNNER_TEMP/helix-smoke/helix"
+          & ./hx.exe --version
+          if ($LASTEXITCODE -ne 0) { throw 'hx --version failed' }
+          & ./hx.exe --health rust
+          if ($LASTEXITCODE -ne 0) { throw 'hx --health rust failed' }
+          if (!(Test-Path runtime/grammars/rust.dll)) { throw 'Rust grammar missing' }
+      - name: Install cargo-deb
+        if: runner.os == 'Linux'
+        uses: taiki-e/install-action@16b05812d776ae1dfaabc8277e421fb6d2506419 # v2.82.7
+        with:
+          tool: cargo-deb@3.8.0
+      - name: Package Linux DEB using upstream metadata
+        if: runner.os == 'Linux'
+        working-directory: upstream
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f runtime/grammars/rust.so
+          mkdir -p ../dist
+          cargo +stable deb --manifest-path helix-term/Cargo.toml --no-build \
+            --deb-version "$DEB_VERSION" --output ../dist/helix-linux-x64.deb
+          dpkg-deb --info ../dist/helix-linux-x64.deb
+          test "$(dpkg-deb --field ../dist/helix-linux-x64.deb Architecture)" = amd64
+      - name: Install and smoke-test DEB
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y ./dist/helix-linux-x64.deb
+          cd "$RUNNER_TEMP"
+          hx --version
+          hx --health rust
+          test -f /usr/lib/helix/runtime/grammars/rust.so
+          test -f /usr/lib/helix/runtime/queries/rust/highlights.scm
+      - name: Upload tested package
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ matrix.platform }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+  publish:
+    needs: [prepare, build]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      UPSTREAM_SHA: ${{ needs.prepare.outputs.sha }}
+      RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Include exact upstream source and build information
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s dist/helix-windows-x64.zip
+          test -s dist/helix-linux-x64.deb
+          curl --fail --location --retry 3 \
+            "https://api.github.com/repos/helix-editor/helix/tarball/$UPSTREAM_SHA" \
+            --output dist/helix-source.tar.gz
+          tar -tzf dist/helix-source.tar.gz > /dev/null
+          cat > dist/BUILD-INFO.txt <<EOF
+          Unofficial Helix master build; not an official Helix release.
+          Upstream commit: $UPSTREAM_SHA
+          Source: https://github.com/helix-editor/helix/tree/$UPSTREAM_SHA
+          License: MPL-2.0 (see LICENSE in the source archive and Windows package).
+          Linux build environment: Ubuntu 22.04 x64.
+          Workflow: https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID
+          Language servers are not included.
+          EOF
+          cd dist
+          sha256sum helix-windows-x64.zip helix-linux-x64.deb helix-source.tar.gz BUILD-INFO.txt > SHA256SUMS
+      - name: Publish only after both platforms pass
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > notes.md <<EOF
+          Unofficial automated build of [helix-editor/helix master](https://github.com/helix-editor/helix).
+
+          Upstream commit: $UPSTREAM_SHA
+
+          - **Windows x64**: extract \`helix-windows-x64.zip\`; keep \`hx.exe\` and \`runtime\` together.
+          - **Linux x64 / Debian and Ubuntu**: install with \`sudo apt install ./helix-linux-x64.deb\`.
+          - Includes matching runtime files and compiled tree-sitter grammars. Language servers are separate.
+          - Linux built on Ubuntu 22.04; other distributions and older glibc versions are not guaranteed.
+          - Source code is provided in \`helix-source.tar.gz\`; see its LICENSE (MPL-2.0).
+          - Verify downloads with \`SHA256SUMS\`.
+
+          [Source revision](https://github.com/helix-editor/helix/tree/$UPSTREAM_SHA) | [Build log](https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID)
+          EOF
+          gh release create "$RELEASE_TAG" dist/* --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" --title "Helix master ${UPSTREAM_SHA:0:12}" \
+            --notes-file notes.md --draft --prerelease --latest=false
+          gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --draft=false
+          echo "Published: https://github.com/$GITHUB_REPOSITORY/releases/tag/$RELEASE_TAG" >> "$GITHUB_STEP_SUMMARY"
